@@ -76,16 +76,35 @@ defmodule SymphonyElixir.ThreadResumeTest do
       {:ok, issue: issue}
     end
 
-    test "names the transition and points at unread comments", %{issue: issue} do
+    test "names the transition and points at what arrived since", %{issue: issue} do
       stored = %{thread_id: "t1", last_state: "Awaiting Review", last_run_at: "2026-09-21T11:40:00Z"}
 
       prompt = PromptBuilder.build_resume_prompt(issue, stored)
 
       assert prompt =~ "GEN-6"
-      assert prompt =~ "Awaiting Review"
-      assert prompt =~ "Executing"
+      assert prompt =~ "moved from `Awaiting Review` to `Executing`"
       assert prompt =~ "2026-09-21T11:40:00Z"
       assert prompt =~ "resuming"
+    end
+
+    test "reports no transition when the state is unchanged", %{issue: issue} do
+      stored = %{thread_id: "t1", last_state: "Executing", last_run_at: "2026-09-21T11:40:00Z"}
+
+      prompt = PromptBuilder.build_resume_prompt(issue, stored)
+
+      refute prompt =~ "moved from"
+      assert prompt =~ "still in `Executing`"
+    end
+
+    test "does not name workflow concepts the workflow may not define", %{issue: issue} do
+      stored = %{thread_id: "t1", last_state: "Awaiting Review", last_run_at: "2026-09-21T11:40:00Z"}
+
+      for stored_thread <- [stored, nil] do
+        prompt = PromptBuilder.build_resume_prompt(issue, stored_thread)
+
+        refute prompt =~ ~r/workpad/i
+        refute prompt =~ ~r/scratchpad/i
+      end
     end
 
     test "still renders when there is no stored transition", %{issue: issue} do
@@ -93,6 +112,7 @@ defmodule SymphonyElixir.ThreadResumeTest do
 
       assert prompt =~ "GEN-6"
       assert prompt =~ "Executing"
+      refute prompt =~ "moved from"
       refute prompt =~ "{{"
     end
 

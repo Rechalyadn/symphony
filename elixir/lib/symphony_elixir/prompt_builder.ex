@@ -25,14 +25,15 @@ defmodule SymphonyElixir.PromptBuilder do
     |> IO.iodata_to_binary()
   end
 
+  # Deliberately free of workflow-specific vocabulary: a resumed thread already
+  # holds the workflow prompt, and naming concepts it does not define (a
+  # scratchpad, a review step) sends the agent looking for something that may
+  # not exist. Override with `codex.resume_prompt` to add workflow specifics.
   @default_resume_prompt """
   You are resuming an existing Codex thread for tracker work item {{ issue.identifier }}.
-  Your prior context is still loaded, so do not restate the task or re-read what you already know.
+  Your prior context is still loaded, so do not restate the task or repeat work you have already finished.
 
-  {% if previous_state %}The work item moved from `{{ previous_state }}` to `{{ issue.state }}` since your last turn.{% else %}The work item is now in `{{ issue.state }}`.{% endif %}
-  {% if last_run_at %}Your last turn ended at {{ last_run_at }}; fetch the work item's comments and read anything added after that time.{% else %}Fetch the work item's comments and read anything you have not seen.{% endif %}
-
-  Re-read the tracking workpad before acting, then continue from the current state.
+  {% if state_changed %}The work item moved from `{{ previous_state }}` to `{{ issue.state }}` since your last turn{% if last_run_at %}, which ended at {{ last_run_at }}{% endif %}. Read whatever was added to the work item since then, then continue under what the new state requires.{% else %}The work item is still in `{{ issue.state }}`. Continue from where your last turn stopped.{% endif %}
   """
 
   @doc """
@@ -44,19 +45,28 @@ defmodule SymphonyElixir.PromptBuilder do
   @spec build_resume_prompt(SymphonyElixir.Tracker.Issue.t(), map() | nil, keyword()) ::
           String.t()
   def build_resume_prompt(issue, stored_thread, opts \\ []) do
+    previous_state = stored_thread && stored_thread[:last_state]
+
     resume_template!()
     |> parse_template!()
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
         "issue" => issue |> Map.from_struct() |> to_solid_map(),
-        "previous_state" => stored_thread && stored_thread[:last_state],
+        "previous_state" => previous_state,
+        "state_changed" => state_changed?(previous_state, issue.state),
         "last_run_at" => stored_thread && stored_thread[:last_run_at]
       },
       @render_opts
     )
     |> IO.iodata_to_binary()
   end
+
+  # Only a real transition is worth reporting. Re-dispatch without a state
+  # change (max_turns, a retry) would otherwise inject "moved from X to X",
+  # which the agent reads as news and acts on.
+  defp state_changed?(nil, _current_state), do: false
+  defp state_changed?(previous_state, current_state), do: previous_state != current_state
 
   defp resume_template! do
     case Config.settings!().codex.resume_prompt do
