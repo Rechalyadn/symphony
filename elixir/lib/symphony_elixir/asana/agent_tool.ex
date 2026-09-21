@@ -47,6 +47,7 @@ defmodule SymphonyElixir.Asana.AgentTool do
   def tool_specs do
     [
       %{
+        "type" => "function",
         "name" => @asana_api_tool,
         "description" => @asana_api_description,
         "inputSchema" => @asana_api_input_schema
