@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_resume_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
@@ -19,6 +20,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          resumed: boolean(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
           dynamic_tool_binding: map()
@@ -38,6 +40,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    resume_thread_id = Keyword.get(opts, :resume_thread_id)
     dynamic_tool_binding = DynamicTool.bind()
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
@@ -45,8 +48,14 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+           {:ok, thread_id, resumed?} <-
+             do_start_session(
+               port,
+               expanded_workspace,
+               session_policies,
+               dynamic_tool_binding,
+               resume_thread_id
+             ) do
         {:ok,
          %{
            port: port,
@@ -56,6 +65,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
+           resumed: resumed?,
            workspace: expanded_workspace,
            worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding
@@ -304,10 +314,40 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
+  defp do_start_session(
+         port,
+         workspace,
+         session_policies,
+         dynamic_tool_binding,
+         resume_thread_id
+       ) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
-      {:error, reason} -> {:error, reason}
+      :ok ->
+        open_thread(port, workspace, session_policies, dynamic_tool_binding, resume_thread_id)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp open_thread(port, workspace, session_policies, dynamic_tool_binding, nil) do
+    with {:ok, thread_id} <-
+           start_thread(port, workspace, session_policies, dynamic_tool_binding) do
+      {:ok, thread_id, false}
+    end
+  end
+
+  defp open_thread(port, workspace, session_policies, dynamic_tool_binding, resume_thread_id)
+       when is_binary(resume_thread_id) do
+    case resume_thread(port, workspace, session_policies, dynamic_tool_binding, resume_thread_id) do
+      {:ok, thread_id} ->
+        Logger.info("Resumed Codex thread thread_id=#{thread_id} workspace=#{workspace}")
+        {:ok, thread_id, true}
+
+      {:error, reason} ->
+        Logger.warning("Unable to resume Codex thread thread_id=#{resume_thread_id} workspace=#{workspace}: #{inspect(reason)}; starting a fresh thread")
+
+        open_thread(port, workspace, session_policies, dynamic_tool_binding, nil)
     end
   end
 
@@ -328,15 +368,36 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     })
 
-    case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
-        end
+    thread_id_from_response(port, @thread_start_id)
+  end
 
-      other ->
-        other
+  defp resume_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         dynamic_tool_binding,
+         resume_thread_id
+       ) do
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => @thread_resume_id,
+      "params" => %{
+        "threadId" => resume_thread_id,
+        "approvalPolicy" => approval_policy,
+        "sandbox" => thread_sandbox,
+        "cwd" => workspace,
+        "dynamicTools" => dynamic_tool_binding.tool_specs
+      }
+    })
+
+    thread_id_from_response(port, @thread_resume_id)
+  end
+
+  defp thread_id_from_response(port, request_id) do
+    case await_response(port, request_id) do
+      {:ok, %{"thread" => %{"id" => thread_id}}} -> {:ok, thread_id}
+      {:ok, %{"thread" => thread_payload}} -> {:error, {:invalid_thread_payload, thread_payload}}
+      other -> other
     end
   end
 

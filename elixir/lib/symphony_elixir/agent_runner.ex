@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, PromptBuilder, ThreadStore, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -88,18 +88,48 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    stored_thread = stored_thread(workspace, worker_host)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    session_opts = [
+      worker_host: worker_host,
+      resume_thread_id: stored_thread && stored_thread.thread_id
+    ]
+
+    with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
+      context = %{
+        app_session: session,
+        workspace: workspace,
+        codex_update_recipient: codex_update_recipient,
+        opts: opts,
+        issue_state_fetcher: issue_state_fetcher,
+        stored_thread: stored_thread,
+        max_turns: max_turns
+      }
+
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(context, issue, 1)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+  defp stored_thread(workspace, worker_host) do
+    if Config.settings!().codex.resume_threads do
+      ThreadStore.load(workspace, worker_host)
+    end
+  end
+
+  defp do_run_codex_turns(context, issue, turn_number) do
+    %{
+      app_session: app_session,
+      workspace: workspace,
+      codex_update_recipient: codex_update_recipient,
+      issue_state_fetcher: issue_state_fetcher,
+      max_turns: max_turns
+    } = context
+
+    prompt = build_turn_prompt(context, issue, turn_number)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -110,20 +140,13 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
+      maybe_record_thread(app_session, workspace, issue)
+
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+          do_run_codex_turns(context, refreshed_issue, turn_number + 1)
 
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
@@ -139,9 +162,27 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp maybe_record_thread(%{resumed: _, thread_id: thread_id, worker_host: worker_host}, workspace, %Issue{state: state}) do
+    # Codex writes the rollout file lazily, so the thread only becomes
+    # resumable once a turn has completed. Record it here, never earlier.
+    if Config.settings!().codex.resume_threads do
+      ThreadStore.save(workspace, thread_id, state, worker_host)
+    end
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+    :ok
+  end
+
+  defp maybe_record_thread(_app_session, _workspace, _issue), do: :ok
+
+  defp build_turn_prompt(%{app_session: %{resumed: true}} = context, issue, 1) do
+    PromptBuilder.build_resume_prompt(issue, context.stored_thread, context.opts)
+  end
+
+  defp build_turn_prompt(context, issue, 1) do
+    PromptBuilder.build_prompt(issue, context.opts)
+  end
+
+  defp build_turn_prompt(%{max_turns: max_turns}, _issue, turn_number) do
     """
     Continuation guidance:
 
