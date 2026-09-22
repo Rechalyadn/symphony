@@ -82,8 +82,12 @@ defmodule SymphonyElixir.Workflow do
     end
   end
 
+  # Only CR and LF count as line breaks. `\R` on a binary also matches the bare
+  # byte 0x85, which is a continuation byte inside plenty of CJK characters
+  # (工具 is E5 B7 A5 E5 85 B7), so it would split one in half and leave the
+  # prompt invalid UTF-8 — Jason then refuses to encode the turn.
   defp split_front_matter(content) do
-    lines = String.split(content, ~r/\R/, trim: false)
+    lines = String.split(content, ~r/\r\n|\r|\n/, trim: false)
 
     case lines do
       ["---" | tail] ->

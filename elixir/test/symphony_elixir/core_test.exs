@@ -206,6 +206,27 @@ defmodule SymphonyElixir.CoreTest do
              Workflow.load(workflow_path)
   end
 
+  test "workflow load keeps multi-byte characters whole" do
+    # 工具 is E5 B7 A5 E5 85 B7. Splitting lines with `\R` on a binary treats the
+    # bare 0x85 as a line break and cuts the second character in half, which
+    # leaves the rendered prompt invalid UTF-8 and unencodable as JSON.
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "CJK_WORKFLOW.md")
+    File.write!(workflow_path, "---\ntracker:\n  kind: linear\n---\n## 你拥有的 Symphony 工具\n\n请继续。\n")
+
+    assert {:ok, %{prompt: prompt}} = Workflow.load(workflow_path)
+    assert String.valid?(prompt)
+    assert prompt =~ "你拥有的 Symphony 工具"
+    assert {:ok, _json} = Jason.encode(prompt)
+  end
+
+  test "workflow load still treats CRLF and lone CR as line breaks" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "CRLF_WORKFLOW.md")
+    File.write!(workflow_path, "---\r\ntracker:\r\n  kind: linear\r\n---\r\nPrompt body\r\n")
+
+    assert {:ok, %{config: %{"tracker" => %{"kind" => "linear"}}, prompt: "Prompt body"}} =
+             Workflow.load(workflow_path)
+  end
+
   test "workflow load rejects non-map front matter" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "INVALID_FRONT_MATTER_WORKFLOW.md")
     File.write!(workflow_path, "---\n- not-a-map\n---\nPrompt body\n")
