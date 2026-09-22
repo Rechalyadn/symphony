@@ -53,7 +53,16 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     binding = BoundDynamicTool.bind()
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
-    assert BoundDynamicTool.bind().tool_specs == []
+
+    # The memory tracker advertises no provider-native tools, but Symphony's
+    # own tools do not come from the tracker and stay bound regardless.
+    assert Enum.map(BoundDynamicTool.bind().tool_specs, & &1["name"]) == [
+             "request_state_change",
+             "job_submit",
+             "job_status",
+             "job_wait",
+             "job_cancel"
+           ]
 
     test_pid = self()
 

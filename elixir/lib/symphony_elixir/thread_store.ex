@@ -15,7 +15,9 @@ defmodule SymphonyElixir.ThreadStore do
   @type record :: %{
           thread_id: String.t(),
           last_state: String.t() | nil,
-          last_run_at: String.t() | nil
+          last_run_at: String.t() | nil,
+          last_comment_at: String.t() | nil,
+          tool_names: [String.t()] | nil
         }
 
   @doc """
@@ -38,7 +40,9 @@ defmodule SymphonyElixir.ThreadStore do
       %{
         thread_id: thread_id,
         last_state: Map.get(decoded, "last_state"),
-        last_run_at: Map.get(decoded, "last_run_at")
+        last_run_at: Map.get(decoded, "last_run_at"),
+        last_comment_at: Map.get(decoded, "last_comment_at"),
+        tool_names: Map.get(decoded, "tool_names")
       }
     else
       _ -> nil
@@ -50,22 +54,29 @@ defmodule SymphonyElixir.ThreadStore do
 
   Call this only once the thread has a completed turn: Codex writes the rollout
   file lazily, so a thread id captured before the first turn cannot be resumed.
+
+  `attrs` carries `:issue_state` and `:latest_comment_at`, both read *after* the
+  turn finished. That ordering is what makes the comment watermark work: by then
+  the agent's own comment is in the tracker and lands under the watermark, so
+  the next run is only told about comments somebody else added.
   """
-  @spec save(Path.t(), String.t(), String.t() | nil, String.t() | nil) :: :ok
-  def save(workspace, thread_id, issue_state, worker_host \\ nil) do
+  @spec save(Path.t(), String.t(), map(), String.t() | nil) :: :ok
+  def save(workspace, thread_id, attrs, worker_host \\ nil) do
     if is_nil(worker_host) and is_binary(workspace) and is_binary(thread_id) do
-      write_record(path(workspace), thread_id, issue_state)
+      write_record(path(workspace), thread_id, attrs)
     end
 
     :ok
   end
 
-  defp write_record(file, thread_id, issue_state) do
+  defp write_record(file, thread_id, attrs) do
     payload =
       Jason.encode!(
         %{
           "thread_id" => thread_id,
-          "last_state" => issue_state,
+          "last_state" => Map.get(attrs, :issue_state),
+          "last_comment_at" => encode_timestamp(Map.get(attrs, :latest_comment_at)),
+          "tool_names" => Map.get(attrs, :tool_names),
           "last_run_at" => DateTime.utc_now() |> DateTime.to_iso8601()
         },
         pretty: true
@@ -80,4 +91,8 @@ defmodule SymphonyElixir.ThreadStore do
         :ok
     end
   end
+
+  defp encode_timestamp(%DateTime{} = timestamp), do: DateTime.to_iso8601(timestamp)
+  defp encode_timestamp(timestamp) when is_binary(timestamp), do: timestamp
+  defp encode_timestamp(_timestamp), do: nil
 end

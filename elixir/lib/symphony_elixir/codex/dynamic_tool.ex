@@ -1,17 +1,17 @@
 defmodule SymphonyElixir.Codex.DynamicTool do
   @moduledoc """
-  Dispatches client-side tool calls to the configured tracker adapter.
+  Dispatches client-side tool calls to the tools bound for the session.
   """
 
-  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.AgentTools
 
   @spec execute(String.t() | nil, term(), map(), keyword()) :: map()
   def execute(tool, arguments, binding, opts \\ []) do
-    Tracker.execute_bound_agent_tool(binding, tool, arguments, opts)
+    AgentTools.execute(binding, tool, arguments, opts)
   end
 
   @spec bind() :: map()
   def bind do
-    Tracker.bind_agent_tools()
+    AgentTools.bind()
   end
 end

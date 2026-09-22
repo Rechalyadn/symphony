@@ -30,6 +30,29 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec list_state_names(Issue.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_state_names(%Issue{}) do
+    case Application.get_env(:symphony_elixir, :memory_tracker_states) do
+      names when is_list(names) -> {:ok, names}
+      _ -> {:error, {:unsupported_tracker_operation, :list_state_names}}
+    end
+  end
+
+  @spec apply_state_change(Issue.t(), String.t()) :: :ok | {:error, term()}
+  def apply_state_change(%Issue{id: issue_id}, state_name) when is_binary(state_name) do
+    applied = Application.get_env(:symphony_elixir, :memory_tracker_state_changes, [])
+    Application.put_env(:symphony_elixir, :memory_tracker_state_changes, applied ++ [{issue_id, state_name}])
+
+    updated =
+      Enum.map(configured_issues(), fn
+        %Issue{id: ^issue_id} = issue -> %{issue | state: state_name}
+        other -> other
+      end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, updated)
+    :ok
+  end
+
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(_tracker_settings), do: []
 
