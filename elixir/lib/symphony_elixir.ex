@@ -38,6 +38,12 @@ defmodule SymphonyElixir.Application do
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       SymphonyElixir.WorkflowStore,
+      SymphonyElixir.Agent.Intents,
+      # Jobs start before — and outside — the agent runtime: that supervisor
+      # restarts :one_for_all, and a running computation must not die with the
+      # orchestrator.
+      SymphonyElixir.Jobs.Registry,
+      SymphonyElixir.Jobs.Supervisor,
       SymphonyElixir.AgentRuntimeSupervisor,
       SymphonyElixir.HttpServer,
       SymphonyElixir.StatusDashboard

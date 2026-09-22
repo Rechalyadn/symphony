@@ -582,14 +582,12 @@ defmodule SymphonyElixir.AppServerTest do
 
                  payload["id"] == 2 and
                    case get_in(payload, ["params", "dynamicTools"]) do
-                     [
-                       %{
-                         "description" => description,
-                         "inputSchema" => %{"required" => ["query"]},
-                         "name" => "linear_graphql"
-                       }
-                     ] ->
-                       description =~ "Linear"
+                     specs when is_list(specs) ->
+                       Enum.any?(specs, fn spec ->
+                         match?(%{"inputSchema" => %{"required" => ["query"]}, "name" => "linear_graphql"}, spec) and
+                           spec["description"] =~ "Linear"
+                       end) and
+                         Enum.any?(specs, &(&1["name"] == "request_state_change"))
 
                      _ ->
                        false
@@ -1589,7 +1587,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [remote_workspace],
+        "writableRoots" => [remote_workspace, Path.join(remote_workspace, ".git")],
         "readOnlyAccess" => %{"type" => "fullAccess"},
         "networkAccess" => false,
         "excludeTmpdirEnvVar" => false,

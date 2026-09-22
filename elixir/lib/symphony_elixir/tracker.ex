@@ -25,10 +25,14 @@ defmodule SymphonyElixir.Tracker do
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
+  @callback list_state_names(Issue.t()) :: {:ok, [String.t()]} | {:error, term()}
+  @callback apply_state_change(Issue.t(), String.t()) :: :ok | {:error, term()}
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
-                      validate_config: 1
+                      validate_config: 1,
+                      list_state_names: 1,
+                      apply_state_change: 2
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
@@ -38,6 +42,39 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
+  end
+
+  @doc """
+  Lists the lifecycle states the work item could be moved to.
+
+  Used to catch a misspelled state while the agent can still react to it.
+  """
+  @spec list_state_names(Issue.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_state_names(%Issue{} = issue) do
+    adapter = adapter()
+
+    if writeable?(adapter, :list_state_names, 1) do
+      adapter.list_state_names(issue)
+    else
+      {:error, {:unsupported_tracker_operation, :list_state_names}}
+    end
+  end
+
+  @doc """
+  Moves a work item to `state_name`.
+
+  This is Symphony's own write, applied once an agent run has returned. Agents
+  register the intent instead; see `SymphonyElixir.Agent.Intents`.
+  """
+  @spec apply_state_change(Issue.t(), String.t()) :: :ok | {:error, term()}
+  def apply_state_change(%Issue{} = issue, state_name) when is_binary(state_name) do
+    adapter = adapter()
+
+    if writeable?(adapter, :apply_state_change, 2) do
+      adapter.apply_state_change(issue, state_name)
+    else
+      {:error, {:unsupported_tracker_operation, :apply_state_change}}
+    end
   end
 
   @doc """
@@ -96,6 +133,10 @@ defmodule SymphonyElixir.Tracker do
       {:ok, adapter} -> {:ok, adapter}
       :error -> {:error, {:unsupported_tracker_kind, kind}}
     end
+  end
+
+  defp writeable?(adapter, function, arity) do
+    Code.ensure_loaded?(adapter) and function_exported?(adapter, function, arity)
   end
 
   defp adapter_for_settings!(%{kind: kind}) do

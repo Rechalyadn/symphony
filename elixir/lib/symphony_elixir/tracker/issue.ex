@@ -24,7 +24,8 @@ defmodule SymphonyElixir.Tracker.Issue do
     labels: [],
     dispatchable: false,
     created_at: nil,
-    updated_at: nil
+    updated_at: nil,
+    latest_comment_at: nil
   ]
 
   @type t :: %__MODULE__{
@@ -42,7 +43,8 @@ defmodule SymphonyElixir.Tracker.Issue do
           blocked_by: [map()],
           dispatchable: boolean(),
           created_at: DateTime.t() | nil,
-          updated_at: DateTime.t() | nil
+          updated_at: DateTime.t() | nil,
+          latest_comment_at: DateTime.t() | nil
         }
 
   @spec label_names(t()) :: [String.t()]

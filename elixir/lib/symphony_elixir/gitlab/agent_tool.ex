@@ -47,6 +47,7 @@ defmodule SymphonyElixir.GitLab.AgentTool do
   def tool_specs do
     [
       %{
+        "type" => "function",
         "name" => @gitlab_api_tool,
         "description" => @gitlab_api_description,
         "inputSchema" => @gitlab_api_input_schema

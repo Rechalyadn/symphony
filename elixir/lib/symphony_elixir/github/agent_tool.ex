@@ -47,6 +47,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   def tool_specs do
     [
       %{
+        "type" => "function",
         "name" => @github_api_tool,
         "description" => @github_api_description,
         "inputSchema" => @github_api_input_schema

@@ -176,6 +176,8 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    alias SymphonyElixir.Config.Schema
+
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
@@ -192,9 +194,14 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
+      field(:network_access, :boolean, default: false)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:resume_threads, :boolean, default: false)
+      field(:resume_prompt, :string)
+      field(:model_tiers, :map, default: %{})
+      field(:reasoning_efforts, :map, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -207,12 +214,19 @@ defmodule SymphonyElixir.Config.Schema do
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
+          :network_access,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :resume_threads,
+          :resume_prompt,
+          :model_tiers,
+          :reasoning_efforts
         ],
         empty_values: []
       )
+      |> update_change(:model_tiers, &Schema.normalize_tier_map/1)
+      |> update_change(:reasoning_efforts, &Schema.normalize_tier_map/1)
       |> validate_required([:command])
       |> validate_change(:command, fn :command, command ->
         if command != "" and String.trim(command) == "" do
@@ -224,6 +238,38 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+  end
+
+  defmodule Jobs do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    alias SymphonyElixir.Config.Schema
+
+    @primary_key false
+    embedded_schema do
+      field(:gated_states, {:array, :string}, default: [])
+      field(:root, :string)
+      field(:heartbeat_ms, :integer, default: 60_000)
+      field(:max_runtime_s, :integer, default: 43_200)
+      field(:max_concurrent_by_compute, :map, default: %{})
+      field(:default_compute, :string, default: "light")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [:gated_states, :root, :heartbeat_ms, :max_runtime_s, :max_concurrent_by_compute, :default_compute],
+        empty_values: []
+      )
+      |> validate_number(:heartbeat_ms, greater_than: 0)
+      |> validate_number(:max_runtime_s, greater_than: 0)
+      |> update_change(:max_concurrent_by_compute, &Schema.normalize_state_limits/1)
+      |> Schema.validate_state_limits(:max_concurrent_by_compute)
     end
   end
 
@@ -296,6 +342,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:jobs, Jobs, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -327,7 +374,7 @@ defmodule SymphonyElixir.Config.Schema do
         workspace
         |> default_workspace_root(settings.workspace.root)
         |> expand_local_workspace_root()
-        |> default_turn_sandbox_policy()
+        |> default_turn_sandbox_policy(settings.codex.network_access)
     end
   end
 
@@ -341,7 +388,7 @@ defmodule SymphonyElixir.Config.Schema do
       _ ->
         workspace
         |> default_workspace_root(settings.workspace.root)
-        |> default_runtime_turn_sandbox_policy(opts)
+        |> default_runtime_turn_sandbox_policy(Keyword.put(opts, :network_access, settings.codex.network_access))
     end
   end
 
@@ -350,6 +397,19 @@ defmodule SymphonyElixir.Config.Schema do
     state_name
     |> String.trim()
     |> String.downcase()
+  end
+
+  @doc false
+  @spec normalize_tier_map(map()) :: map()
+  def normalize_tier_map(tiers) when is_map(tiers) do
+    Enum.reduce(tiers, %{}, fn {tier, value}, acc ->
+      normalized_tier = tier |> to_string() |> String.trim() |> String.downcase()
+
+      case value do
+        value when is_binary(value) -> Map.put(acc, normalized_tier, String.trim(value))
+        _ -> acc
+      end
+    end)
   end
 
   @doc false
@@ -390,6 +450,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:jobs, with: &Jobs.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
@@ -460,7 +521,9 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    jobs = %{settings.jobs | root: resolve_jobs_root(settings.jobs.root, workspace.root)}
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, jobs: jobs}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -500,6 +563,13 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp resolve_secret_setting(value, _fallback), do: value
+
+  # Jobs outlive the workspaces they were started from, so their records sit
+  # beside the workspace root rather than inside any one workspace.
+  defp resolve_jobs_root(root, workspace_root) when is_binary(root), do: resolve_path_value(root, default_jobs_root(workspace_root))
+  defp resolve_jobs_root(_root, workspace_root), do: default_jobs_root(workspace_root)
+
+  defp default_jobs_root(workspace_root), do: Path.join(workspace_root, ".symphony-jobs")
 
   defp resolve_path_value(value, default) when is_binary(value) do
     case normalize_path_token(value) do
@@ -567,24 +637,32 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_secret_value(_value), do: nil
 
-  defp default_turn_sandbox_policy(workspace) do
+  defp default_turn_sandbox_policy(workspace, network_access) do
     %{
       "type" => "workspaceWrite",
-      "writableRoots" => [workspace],
+      "writableRoots" => workspace_writable_roots(workspace),
       "readOnlyAccess" => %{"type" => "fullAccess"},
-      "networkAccess" => false,
+      "networkAccess" => network_access,
       "excludeTmpdirEnvVar" => false,
       "excludeSlashTmp" => false
     }
   end
 
+  # Codex keeps `.git` read-only inside a workspace-write root unless the path
+  # is named outright, so `git commit` fails with a read-only `index.lock`.
+  # Symphony expects agents to commit their work, so the repository directory
+  # is always writable. Verified against codex 0.154.0.
+  defp workspace_writable_roots(workspace), do: [workspace, Path.join(workspace, ".git")]
+
   defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
+    network_access = Keyword.get(opts, :network_access, false)
+
     if Keyword.get(opts, :remote, false) do
-      {:ok, default_turn_sandbox_policy(workspace_root)}
+      {:ok, default_turn_sandbox_policy(workspace_root, network_access)}
     else
       with expanded_workspace_root <- expand_local_workspace_root(workspace_root),
            {:ok, canonical_workspace_root} <- PathSafety.canonicalize(expanded_workspace_root) do
-        {:ok, default_turn_sandbox_policy(canonical_workspace_root)}
+        {:ok, default_turn_sandbox_policy(canonical_workspace_root, network_access)}
       end
     end
   end

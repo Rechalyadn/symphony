@@ -47,6 +47,7 @@ defmodule SymphonyElixir.Jira.AgentTool do
   def tool_specs do
     [
       %{
+        "type" => "function",
         "name" => @jira_rest_tool,
         "description" => @jira_rest_description,
         "inputSchema" => @jira_rest_input_schema

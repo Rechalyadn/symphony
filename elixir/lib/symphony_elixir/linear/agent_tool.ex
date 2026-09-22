@@ -46,6 +46,7 @@ defmodule SymphonyElixir.Linear.AgentTool do
   def tool_specs do
     [
       %{
+        "type" => "function",
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema

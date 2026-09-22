@@ -42,6 +42,14 @@ defmodule SymphonyElixir.Linear.Adapter do
     AgentTool.execute(tool, arguments, opts)
   end
 
+  @spec list_state_names(Issue.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_state_names(%Issue{} = issue), do: client_module().list_state_names(issue)
+
+  @spec apply_state_change(Issue.t(), String.t()) :: :ok | {:error, term()}
+  def apply_state_change(%Issue{} = issue, state_name) when is_binary(state_name) do
+    client_module().apply_state_change(issue, state_name)
+  end
+
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(tracker_settings), do: tracker_settings.secret_environment_names
 

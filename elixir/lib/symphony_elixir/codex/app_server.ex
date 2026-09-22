@@ -4,11 +4,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
+  alias SymphonyElixir.Agent.ModelTier
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_resume_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
@@ -19,6 +21,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          resumed: boolean(),
+          model_selection: ModelTier.selection(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
           dynamic_tool_binding: map()
@@ -38,6 +42,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    resume_thread_id = Keyword.get(opts, :resume_thread_id)
+    model_selection = ModelTier.resolve(Keyword.get(opts, :issue))
     dynamic_tool_binding = DynamicTool.bind()
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
@@ -45,8 +51,14 @@ defmodule SymphonyElixir.Codex.AppServer do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+           {:ok, thread_id, resumed?} <-
+             do_start_session(
+               port,
+               expanded_workspace,
+               session_policies,
+               dynamic_tool_binding,
+               {resume_thread_id, model_selection}
+             ) do
         {:ok,
          %{
            port: port,
@@ -56,6 +68,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
+           resumed: resumed?,
+           model_selection: model_selection,
            workspace: expanded_workspace,
            worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding
@@ -79,7 +93,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: thread_id,
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding
-        },
+        } = session,
         prompt,
         issue,
         opts \\ []
@@ -88,10 +102,22 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
+        DynamicTool.execute(tool, arguments, dynamic_tool_binding,
+          issue: issue,
+          workspace: workspace,
+          codex_update_recipient: Keyword.get(opts, :codex_update_recipient)
+        )
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    turn_options = %{
+      approval_policy: approval_policy,
+      turn_sandbox_policy: turn_sandbox_policy,
+      # Reasoning effort is a turn/start parameter; only the model can be set
+      # when the thread opens.
+      effort: session |> Map.get(:model_selection, %{}) |> Map.get(:effort)
+    }
+
+    case start_turn(port, thread_id, prompt, issue, workspace, turn_options) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -304,10 +330,44 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
+  defp do_start_session(
+         port,
+         workspace,
+         session_policies,
+         dynamic_tool_binding,
+         thread_opening
+       ) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
-      {:error, reason} -> {:error, reason}
+      :ok ->
+        open_thread(port, workspace, session_policies, dynamic_tool_binding, thread_opening)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp open_thread(port, workspace, session_policies, dynamic_tool_binding, {nil, model_selection}) do
+    with {:ok, thread_id} <-
+           start_thread(port, workspace, session_policies, dynamic_tool_binding, model_selection) do
+      {:ok, thread_id, false}
+    end
+  end
+
+  # A failed resume stops the run rather than cold-starting. A fresh thread has
+  # none of the prior context, so it would silently redo work the agent had
+  # already finished. Recovery is deliberate: delete `.symphony/thread.json`
+  # from the workspace and the next dispatch cold-starts.
+  defp open_thread(port, workspace, session_policies, dynamic_tool_binding, {resume_thread_id, model_selection})
+       when is_binary(resume_thread_id) do
+    case resume_thread(port, workspace, session_policies, dynamic_tool_binding, resume_thread_id, model_selection) do
+      {:ok, thread_id} ->
+        Logger.info("Resumed Codex thread thread_id=#{thread_id} workspace=#{workspace}")
+        {:ok, thread_id, true}
+
+      {:error, reason} ->
+        Logger.error("Unable to resume Codex thread thread_id=#{resume_thread_id} workspace=#{workspace}: #{inspect(reason)}; delete .symphony/thread.json in the workspace to cold-start instead")
+
+        {:error, {:thread_resume_failed, resume_thread_id, reason}}
     end
   end
 
@@ -315,48 +375,77 @@ defmodule SymphonyElixir.Codex.AppServer do
          port,
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
-         dynamic_tool_binding
+         dynamic_tool_binding,
+         model_selection
        ) do
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => dynamic_tool_binding.tool_specs
-      }
+      "params" =>
+        %{
+          "approvalPolicy" => approval_policy,
+          "sandbox" => thread_sandbox,
+          "cwd" => workspace,
+          "dynamicTools" => dynamic_tool_binding.tool_specs
+        }
+        |> maybe_put("model", model_selection[:model])
     })
 
-    case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
-        end
+    thread_id_from_response(port, @thread_start_id)
+  end
 
-      other ->
-        other
+  defp resume_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         dynamic_tool_binding,
+         resume_thread_id,
+         model_selection
+       ) do
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => @thread_resume_id,
+      "params" =>
+        %{
+          "threadId" => resume_thread_id,
+          "approvalPolicy" => approval_policy,
+          "sandbox" => thread_sandbox,
+          "cwd" => workspace,
+          "dynamicTools" => dynamic_tool_binding.tool_specs
+        }
+        |> maybe_put("model", model_selection[:model])
+    })
+
+    thread_id_from_response(port, @thread_resume_id)
+  end
+
+  defp thread_id_from_response(port, request_id) do
+    case await_response(port, request_id) do
+      {:ok, %{"thread" => %{"id" => thread_id}}} -> {:ok, thread_id}
+      {:ok, %{"thread" => thread_payload}} -> {:error, {:invalid_thread_payload, thread_payload}}
+      other -> other
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp start_turn(port, thread_id, prompt, issue, workspace, turn_options) do
     send_message(port, %{
       "method" => "turn/start",
       "id" => @turn_start_id,
-      "params" => %{
-        "threadId" => thread_id,
-        "input" => [
-          %{
-            "type" => "text",
-            "text" => prompt
-          }
-        ],
-        "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
-        "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
-      }
+      "params" =>
+        %{
+          "threadId" => thread_id,
+          "input" => [
+            %{
+              "type" => "text",
+              "text" => prompt
+            }
+          ],
+          "cwd" => workspace,
+          "title" => "#{issue.identifier}: #{issue.title}",
+          "approvalPolicy" => turn_options.approval_policy,
+          "sandboxPolicy" => turn_options.turn_sandbox_policy
+        }
+        |> maybe_put("effort", turn_options.effort)
     })
 
     case await_response(port, @turn_start_id) do
@@ -1000,6 +1089,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp maybe_set_usage(metadata, _payload), do: metadata
 
+  defp maybe_put(params, _key, nil), do: params
+  defp maybe_put(params, key, value), do: Map.put(params, key, value)
+
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
@@ -1027,9 +1119,18 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp tool_call_arguments(_params), do: %{}
 
+  # A tool call that blocks for a long time — `job_wait` is the whole point of
+  # one — can outlive the codex process it is answering. `Port.command/2` on a
+  # closed port raises `:badarg`, which reaches the orchestrator as an opaque
+  # crash; say what actually happened instead.
   defp send_message(port, message) do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)
+  rescue
+    ArgumentError ->
+      Logger.warning("Codex app-server port closed before Symphony could send #{inspect(Map.get(message, "method") || Map.get(message, "id"))}")
+
+      false
   end
 
   defp needs_input?("mcpServer/elicitation/request", payload) when is_map(payload), do: true

@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Linear.Client do
   alias SymphonyElixir.Tracker.Issue
 
   @issue_page_size 50
+  @workflow_state_page_size 50
   @max_error_body_log_bytes 1_000
 
   @query """
@@ -30,6 +31,14 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
+          }
+        }
+        comments(first: 1) {
+          nodes {
+            createdAt
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -75,6 +84,14 @@ defmodule SymphonyElixir.Linear.Client do
         labels {
           nodes {
             name
+            parent {
+              name
+            }
+          }
+        }
+        comments(first: 1) {
+          nodes {
+            createdAt
           }
         }
         inverseRelations(first: $relationFirst) {
@@ -100,6 +117,31 @@ defmodule SymphonyElixir.Linear.Client do
   query SymphonyLinearViewer {
     viewer {
       id
+    }
+  }
+  """
+
+  @issue_states_query """
+  query SymphonyLinearIssueStates($id: String!, $first: Int!) {
+    issue(id: $id) {
+      id
+      team {
+        id
+        states(first: $first) {
+          nodes {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+  """
+
+  @issue_state_mutation """
+  mutation SymphonyLinearIssueState($id: String!, $stateId: String!) {
+    issueUpdate(id: $id, input: {stateId: $stateId}) {
+      success
     }
   }
   """
@@ -133,6 +175,32 @@ defmodule SymphonyElixir.Linear.Client do
              {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_issue_states(ids, tracker.project_slug, assignee_filter)
         end
+    end
+  end
+
+  @doc """
+  Names of every workflow state on the work item's team.
+  """
+  @spec list_state_names(Issue.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_state_names(%Issue{id: issue_id}) when is_binary(issue_id) do
+    with {:ok, states} <- fetch_workflow_states(issue_id) do
+      {:ok, Enum.map(states, fn {name, _id} -> name end)}
+    end
+  end
+
+  @doc """
+  Moves a work item to the named workflow state.
+
+  Linear addresses states by id, so the name is resolved against the item's own
+  team; a name the team does not have is an error rather than a silent no-op.
+  """
+  @spec apply_state_change(Issue.t(), String.t()) :: :ok | {:error, term()}
+  def apply_state_change(%Issue{id: issue_id}, state_name)
+      when is_binary(issue_id) and is_binary(state_name) do
+    with {:ok, states} <- fetch_workflow_states(issue_id),
+         {:ok, state_id} <- find_state_id(states, state_name),
+         {:ok, body} <- graphql(@issue_state_mutation, %{"id" => issue_id, "stateId" => state_id}) do
+      confirm_state_change(body, state_name)
     end
   end
 
@@ -313,6 +381,40 @@ defmodule SymphonyElixir.Linear.Client do
     end)
   end
 
+  defp fetch_workflow_states(issue_id) do
+    case graphql(@issue_states_query, %{"id" => issue_id, "first" => @workflow_state_page_size}) do
+      {:ok, %{"data" => %{"issue" => %{"team" => %{"states" => %{"nodes" => nodes}}}}}} when is_list(nodes) ->
+        states =
+          nodes
+          |> Enum.map(fn node -> {node["name"], node["id"]} end)
+          |> Enum.filter(fn {name, id} -> is_binary(name) and is_binary(id) end)
+
+        {:ok, states}
+
+      {:ok, %{"errors" => errors}} ->
+        {:error, {:linear_graphql_errors, errors}}
+
+      {:ok, _body} ->
+        {:error, :linear_unknown_payload}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp find_state_id(states, state_name) do
+    wanted = normalize_state_name(state_name)
+
+    case Enum.find(states, fn {name, _id} -> normalize_state_name(name) == wanted end) do
+      {_name, id} -> {:ok, id}
+      nil -> {:error, {:unknown_workflow_state, state_name, Enum.map(states, fn {name, _id} -> name end)}}
+    end
+  end
+
+  defp confirm_state_change(%{"data" => %{"issueUpdate" => %{"success" => true}}}, _state_name), do: :ok
+  defp confirm_state_change(%{"errors" => errors}, _state_name), do: {:error, {:linear_graphql_errors, errors}}
+  defp confirm_state_change(body, state_name), do: {:error, {:linear_state_change_rejected, state_name, body}}
+
   defp build_graphql_payload(query, variables, operation_name) do
     %{
       "query" => query,
@@ -483,7 +585,8 @@ defmodule SymphonyElixir.Linear.Client do
         labels: extract_labels(issue),
         dispatchable: dispatchable?(state_name, blockers, assignee, assignee_filter),
         created_at: parse_datetime(issue["createdAt"]),
-        updated_at: parse_datetime(issue["updatedAt"])
+        updated_at: parse_datetime(issue["updatedAt"]),
+        latest_comment_at: extract_latest_comment_at(issue)
       }
     end
   end
@@ -604,16 +707,41 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp normalize_assignee_match_value(_value), do: nil
 
+  # Linear returns comments newest first, so `comments(first: 1)` is the latest
+  # one (verified against the API; `last: 1` returns the oldest).
+  defp extract_latest_comment_at(%{"comments" => %{"nodes" => nodes}}) when is_list(nodes) do
+    nodes
+    |> Enum.map(&parse_datetime(&1["createdAt"]))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max(DateTime, fn -> nil end)
+  end
+
+  defp extract_latest_comment_at(_issue), do: nil
+
+  # A label inside a Linear label group reports only its own name, so a `model`
+  # group holding `terra` would be indistinguishable from a loose `terra`
+  # label. Emit both spellings and let the caller match whichever it knows.
   defp extract_labels(%{"labels" => %{"nodes" => labels}}) when is_list(labels) do
     labels
-    |> Enum.map(& &1["name"])
-    |> Enum.filter(&is_binary/1)
-    |> Enum.map(&(String.trim(&1) |> String.downcase()))
+    |> Enum.flat_map(&label_names/1)
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
   end
 
   defp extract_labels(_), do: []
+
+  defp label_names(%{"name" => name} = label) when is_binary(name) do
+    normalized = normalize_label(name)
+
+    case get_in(label, ["parent", "name"]) do
+      parent when is_binary(parent) -> [normalized, normalize_label(parent) <> "/" <> normalized]
+      _ -> [normalized]
+    end
+  end
+
+  defp label_names(_label), do: []
+
+  defp normalize_label(name) when is_binary(name), do: name |> String.trim() |> String.downcase()
 
   defp extract_blockers(%{"inverseRelations" => %{"nodes" => inverse_relations}})
        when is_list(inverse_relations) do

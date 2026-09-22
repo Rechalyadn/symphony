@@ -206,6 +206,27 @@ defmodule SymphonyElixir.CoreTest do
              Workflow.load(workflow_path)
   end
 
+  test "workflow load keeps multi-byte characters whole" do
+    # 工具 is E5 B7 A5 E5 85 B7. Splitting lines with `\R` on a binary treats the
+    # bare 0x85 as a line break and cuts the second character in half, which
+    # leaves the rendered prompt invalid UTF-8 and unencodable as JSON.
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "CJK_WORKFLOW.md")
+    File.write!(workflow_path, "---\ntracker:\n  kind: linear\n---\n## 你拥有的 Symphony 工具\n\n请继续。\n")
+
+    assert {:ok, %{prompt: prompt}} = Workflow.load(workflow_path)
+    assert String.valid?(prompt)
+    assert prompt =~ "你拥有的 Symphony 工具"
+    assert {:ok, _json} = Jason.encode(prompt)
+  end
+
+  test "workflow load still treats CRLF and lone CR as line breaks" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "CRLF_WORKFLOW.md")
+    File.write!(workflow_path, "---\r\ntracker:\r\n  kind: linear\r\n---\r\nPrompt body\r\n")
+
+    assert {:ok, %{config: %{"tracker" => %{"kind" => "linear"}}, prompt: "Prompt body"}} =
+             Workflow.load(workflow_path)
+  end
+
   test "workflow load rejects non-map front matter" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "INVALID_FRONT_MATTER_WORKFLOW.md")
     File.write!(workflow_path, "---\n- not-a-map\n---\nPrompt body\n")
@@ -1048,6 +1069,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1056,7 +1078,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, sent_at_ms, 500, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1089,6 +1111,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1096,7 +1119,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, sent_at_ms, 39_500, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1128,6 +1151,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1135,7 +1159,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, sent_at_ms, 9_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1255,11 +1279,14 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  # Measured from when the exit was sent, not from when the assertion runs:
+  # the time spent waiting for the orchestrator to process it would otherwise
+  # eat into the lower bound, and on a loaded CI runner it did.
+  defp assert_due_in_range(due_at_ms, sent_at_ms, min_delay_ms, max_delay_ms) do
+    delay_ms = due_at_ms - sent_at_ms
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+    assert delay_ms >= min_delay_ms
+    assert delay_ms <= max_delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1901,8 +1928,7 @@ defmodule SymphonyElixir.CoreTest do
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
-      assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
-      assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "Continuation turn #2 of 3"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -2118,7 +2144,7 @@ defmodule SymphonyElixir.CoreTest do
 
       expected_turn_sandbox_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [canonical_workspace],
+        "writableRoots" => [canonical_workspace, Path.join(canonical_workspace, ".git")],
         "readOnlyAccess" => %{"type" => "fullAccess"},
         "networkAccess" => false,
         "excludeTmpdirEnvVar" => false,
