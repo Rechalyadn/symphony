@@ -400,9 +400,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   @doc false
-  @spec normalize_tier_map(nil | map()) :: map()
-  def normalize_tier_map(nil), do: %{}
-
+  @spec normalize_tier_map(map()) :: map()
   def normalize_tier_map(tiers) when is_map(tiers) do
     Enum.reduce(tiers, %{}, fn {tier, value}, acc ->
       normalized_tier = tier |> to_string() |> String.trim() |> String.downcase()
@@ -654,11 +652,7 @@ defmodule SymphonyElixir.Config.Schema do
   # is named outright, so `git commit` fails with a read-only `index.lock`.
   # Symphony expects agents to commit their work, so the repository directory
   # is always writable. Verified against codex 0.154.0.
-  defp workspace_writable_roots(workspace) when is_binary(workspace) do
-    [workspace, Path.join(workspace, ".git")]
-  end
-
-  defp workspace_writable_roots(_workspace), do: []
+  defp workspace_writable_roots(workspace), do: [workspace, Path.join(workspace, ".git")]
 
   defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
     network_access = Keyword.get(opts, :network_access, false)

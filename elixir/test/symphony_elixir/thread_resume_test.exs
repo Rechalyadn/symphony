@@ -82,6 +82,20 @@ defmodule SymphonyElixir.ThreadResumeTest do
       assert %{tool_names: ["job_submit", "linear_graphql"]} = ThreadStore.load(workspace)
     end
 
+    test "a watermark already in string form is kept as is", %{workspace: workspace} do
+      :ok = ThreadStore.save(workspace, "thread-abc", %{latest_comment_at: "2026-09-21T11:40:00Z"})
+
+      assert %{last_comment_at: "2026-09-21T11:40:00Z"} = ThreadStore.load(workspace)
+    end
+
+    test "a record that cannot be written is logged, not raised", %{workspace: workspace} do
+      File.write!(Path.join(workspace, ".symphony"), "a file where the directory should be")
+
+      log = capture_log(fn -> assert :ok = ThreadStore.save(workspace, "thread-abc", %{}) end)
+
+      assert log =~ "Unable to record Codex thread"
+    end
+
     test "an older record without a tool set still loads", %{workspace: workspace} do
       path = ThreadStore.path(workspace)
       File.mkdir_p!(Path.dirname(path))
@@ -153,6 +167,18 @@ defmodule SymphonyElixir.ThreadResumeTest do
 
       assert PromptBuilder.build_resume_prompt(issue, stale) =~ "Issue 有新评论"
       refute PromptBuilder.build_resume_prompt(issue, current) =~ "Issue 有新评论"
+    end
+
+    test "an unreadable watermark counts as new comments", %{issue: issue} do
+      issue = %{issue | latest_comment_at: ~U[2026-09-21 12:00:00Z]}
+
+      assert PromptBuilder.build_resume_prompt(issue, %{thread_id: "t1", last_comment_at: "garbage"}) =~ "Issue 有新评论"
+    end
+
+    test "a work item with no state never announces jobs", %{issue: issue} do
+      write_workflow_file!(Workflow.workflow_file_path(), jobs_gated_states: ["Executing"])
+
+      refute PromptBuilder.build_resume_prompt(%{issue | state: nil}, nil) =~ "长时作业"
     end
 
     test "says nothing about comments on a work item that has none", %{issue: issue} do

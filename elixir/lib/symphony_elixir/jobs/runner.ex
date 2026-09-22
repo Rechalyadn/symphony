@@ -66,10 +66,8 @@ defmodule SymphonyElixir.Jobs.Runner do
         ]
       )
 
-    case :erlang.port_info(port, :os_pid) do
-      {:os_pid, os_pid} -> Registry.attach_os_pid(issue_id, os_pid)
-      _ -> :ok
-    end
+    {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+    Registry.attach_os_pid(issue_id, os_pid)
 
     Process.send_after(self(), :heartbeat, heartbeat_ms)
     Process.send_after(self(), :max_runtime, max_runtime_s * 1_000)
@@ -147,10 +145,12 @@ defmodule SymphonyElixir.Jobs.Runner do
 
   defp close_port(port) when is_port(port) do
     # Kill the shell's whole process group: the computation is usually a child
-    # of the bash we spawned, and closing the port alone would orphan it.
-    case :erlang.port_info(port, :os_pid) do
-      {:os_pid, os_pid} -> System.cmd("kill", ["-TERM", "-#{os_pid}"], stderr_to_stdout: true)
-      _ -> {"", 0}
+    # of the bash we spawned, and closing the port alone leaves it running. The
+    # port's process is its own group leader, so `-pid` names the group; the
+    # `--` matters, without it `kill` parses `-pid` as an option and does
+    # nothing.
+    with {:os_pid, os_pid} <- :erlang.port_info(port, :os_pid) do
+      System.cmd("kill", ["-TERM", "--", "-#{os_pid}"], stderr_to_stdout: true)
     end
 
     Port.close(port)
@@ -158,10 +158,7 @@ defmodule SymphonyElixir.Jobs.Runner do
     _, _ -> :ok
   end
 
-  defp close_port(_port), do: :ok
-
-  defp port_alive?(port) when is_port(port), do: :erlang.port_info(port) != :undefined
-  defp port_alive?(_port), do: false
+  defp port_alive?(port), do: :erlang.port_info(port) != :undefined
 
   # The event name must never be one the orchestrator reads as "needs a human":
   # `:turn_input_required` and `:approval_required` put the issue in the blocked

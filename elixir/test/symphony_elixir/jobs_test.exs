@@ -94,13 +94,48 @@ defmodule SymphonyElixir.JobsTest do
       run("job_cancel", %{}, context)
     end
 
-    test "cancelling stops the job", context do
-      assert run("job_submit", %{"command" => "sleep 30"}, context)["success"] == true
+    test "cancelling kills the computation, not just the port", context do
+      # The computation is a child of the shell we spawn. Closing the port alone
+      # leaves it running, so this checks the grandchild is actually gone.
+      pid_file = Path.join(context.workspace, "child.pid")
+      command = "sleep 30 & echo $! > #{pid_file}; wait"
+
+      assert run("job_submit", %{"command" => command}, context)["success"] == true
+      child = await_file(pid_file)
+      assert Registry.os_process_alive?(child)
 
       assert payload(run("job_cancel", %{"reason" => "changed my mind"}, context))["cancelled"] == true
 
       assert {:ok, entry} = await_finished(context.issue.id)
       assert entry.status == :killed
+      assert await_dead(child)
+    end
+
+    test "a job past its runtime cap is killed", context do
+      pid_file = Path.join(context.workspace, "capped.pid")
+      command = "sleep 30 & echo $! > #{pid_file}; wait"
+
+      assert run("job_submit", %{"command" => command, "max_runtime_s" => 1}, context)["success"] == true
+      child = await_file(pid_file)
+
+      wait = run("job_wait", %{"timeout_s" => 10}, context)
+
+      assert payload(wait)["job"]["status"] == "killed"
+      assert await_dead(child)
+    end
+
+    test "cancelling a finished job reports it and changes nothing", context do
+      assert run("job_submit", %{"command" => "true"}, context)["success"] == true
+      assert run("job_wait", %{"timeout_s" => 10}, context)["success"] == true
+
+      response = payload(run("job_cancel", %{}, context))
+
+      assert response["cancelled"] == false
+      assert response["job"]["status"] == "exited"
+    end
+
+    test "cancelling with no job on record is a harmless no-op", context do
+      assert payload(run("job_cancel", %{}, context))["cancelled"] == false
     end
 
     test "a failing command is reported with its exit status", context do
@@ -110,6 +145,98 @@ defmodule SymphonyElixir.JobsTest do
 
       assert payload(wait)["job"]["exit_status"] == 3
       assert payload(wait)["log_tail"] =~ "boom"
+    end
+  end
+
+  describe "argument and binding errors" do
+    test "a blank command is refused", context do
+      response = run("job_submit", %{"command" => "   "}, context)
+
+      assert response["success"] == false
+      assert payload(response)["error"]["message"] =~ "non-empty"
+    end
+
+    test "arguments that are not an object are treated as empty", context do
+      assert run("job_submit", "sleep 1", context)["success"] == false
+    end
+
+    test "job_wait needs a positive timeout", context do
+      assert run("job_wait", %{"timeout_s" => 0}, context)["success"] == false
+    end
+
+    test "job_wait with nothing to wait for says so", context do
+      response = run("job_wait", %{"timeout_s" => 1}, context)
+
+      assert response["success"] == false
+      assert payload(response)["error"]["message"] =~ "no job"
+    end
+
+    test "a session without a work item gets a clear refusal", context do
+      response = AgentTool.execute("job_status", %{}, workspace: context.workspace)
+
+      assert response["success"] == false
+    end
+
+    test "a session without a workspace cannot submit", context do
+      response = AgentTool.execute("job_submit", %{"command" => "true"}, issue: context.issue)
+
+      assert response["success"] == false
+      assert payload(response)["error"]["message"] =~ "workspace"
+    end
+
+    test "an unknown tool name is refused", context do
+      assert run("job_explode", %{}, context)["success"] == false
+    end
+
+    test "a runner that cannot start frees the slot again", context do
+      # A jobs root under a regular file can hold neither the record nor the
+      # log, so the runner fails to start; the slot must not stay claimed.
+      blocker = Path.join(context.jobs_root, "not-a-directory")
+      File.write!(blocker, "")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        jobs_gated_states: ["Executing"],
+        jobs_root: Path.join(blocker, "jobs")
+      )
+
+      response =
+        capture_log(fn -> send(self(), {:response, run("job_submit", %{"command" => "true"}, context)}) end)
+        |> then(fn log ->
+          assert log =~ "Unable to record job"
+          assert_received {:response, response}
+          response
+        end)
+
+      assert response["success"] == false
+      assert payload(response)["error"]["message"] =~ "could not start"
+      assert Registry.get(context.issue.id) == nil
+    end
+  end
+
+  describe "compute budget" do
+    test "the compute tier comes from the label and its budget is enforced", context do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        jobs_gated_states: ["Executing"],
+        jobs_root: context.jobs_root,
+        jobs_max_concurrent_by_compute: %{"heavy" => 1}
+      )
+
+      heavy = %{context | issue: %{context.issue | labels: ["symphony", "compute:heavy"]}}
+      other_issue = %{heavy.issue | id: heavy.issue.id <> "-b", identifier: "GEN-21"}
+      other = %{heavy | issue: other_issue}
+
+      on_exit(fn -> Registry.release(other_issue.id) end)
+
+      assert payload(run("job_submit", %{"command" => "sleep 10"}, heavy))["job"]["compute"] == "heavy"
+
+      refused = run("job_submit", %{"command" => "sleep 10"}, other)
+
+      assert refused["success"] == false
+      assert payload(refused)["error"]["message"] =~ "heavy"
+
+      run("job_cancel", %{}, heavy)
     end
   end
 
@@ -124,6 +251,10 @@ defmodule SymphonyElixir.JobsTest do
       assert Registry.get(context.issue.id) == nil
     end
 
+    test "a work item with no state cannot submit", context do
+      assert run("job_submit", %{"command" => "true"}, put_in(context.issue.state, nil))["success"] == false
+    end
+
     test "job_status still works outside the gated states", context do
       # An agent picking up last round's result has to be able to read it
       # before it is allowed to start anything new.
@@ -135,6 +266,117 @@ defmodule SymphonyElixir.JobsTest do
 
       assert response["success"] == true
       assert payload(response)["job"]["status"] == "exited"
+    end
+  end
+
+  describe "registry" do
+    test "await on a finished job returns it at once", context do
+      assert run("job_submit", %{"command" => "true"}, context)["success"] == true
+      assert {:ok, %{status: :exited}} = Registry.await(context.issue.id, 10_000)
+
+      assert {:ok, %{status: :exited}} = Registry.await(context.issue.id, 0)
+    end
+
+    test "await with no job on record says so", context do
+      assert Registry.await(context.issue.id, 0) == :no_job
+    end
+
+    test "a stale completion message is not mistaken for the current job", context do
+      # An earlier await that timed out can leave its completion message in the
+      # mailbox; the next await must wait on the job running now.
+      send(self(), {:job_finished, context.issue.id, %{status: :exited, stale: true}})
+
+      assert run("job_submit", %{"command" => "sleep 5"}, context)["success"] == true
+      assert Registry.await(context.issue.id, 200) == :timeout
+
+      run("job_cancel", %{}, context)
+    end
+
+    test "attaching to a slot that is gone does nothing", context do
+      :ok = Registry.attach_runner(context.issue.id, self())
+      :ok = Registry.attach_os_pid(context.issue.id, 12_345)
+      _ = :sys.get_state(Registry)
+
+      assert Registry.get(context.issue.id) == nil
+    end
+
+    test "recovery tolerates records with odd timestamps", context do
+      File.mkdir_p!(context.jobs_root)
+
+      for {suffix, started_at} <- [{"bad", "yesterday"}, {"missing", nil}] do
+        issue_id = context.issue.id <> "-" <> suffix
+        on_exit(fn -> Registry.release(issue_id) end)
+
+        File.write!(
+          Registry.record_path(issue_id),
+          Jason.encode!(%{"job_id" => "job-#{suffix}", "issue_id" => issue_id, "status" => "exited", "started_at" => started_at})
+        )
+      end
+
+      :ok = Registry.recover()
+
+      assert %{status: :exited, started_at: %DateTime{}} = Registry.get(context.issue.id <> "-bad")
+      assert %{status: :exited, started_at: %DateTime{}} = Registry.get(context.issue.id <> "-missing")
+    end
+
+    test "an orphaned job reports whether its process is still alive", context do
+      assert Registry.os_process_alive?(String.to_integer(System.pid()))
+      refute Registry.os_process_alive?(nil)
+
+      File.mkdir_p!(context.jobs_root)
+
+      File.write!(
+        Registry.record_path(context.issue.id),
+        Jason.encode!(%{
+          "job_id" => "job-detached",
+          "issue_id" => context.issue.id,
+          "status" => "running",
+          "started_at" => "2026-09-21T00:00:00Z",
+          "log_file" => Path.join(context.jobs_root, "detached.log"),
+          "os_pid" => String.to_integer(System.pid())
+        })
+      )
+
+      :ok = Registry.recover()
+
+      assert payload(run("job_status", %{}, context))["job"]["still_running_detached"] == true
+    end
+  end
+
+  describe "runner" do
+    test "stopping the supervisor child kills the computation", context do
+      pid_file = Path.join(context.workspace, "shutdown.pid")
+
+      assert run("job_submit", %{"command" => "sleep 30 & echo $! > #{pid_file}; wait"}, context)["success"] == true
+      child = await_file(pid_file)
+      %{runner: runner} = await_runner(context.issue.id)
+
+      :ok = DynamicSupervisor.terminate_child(SymphonyElixir.Jobs.Supervisor, runner)
+
+      assert await_dead(child)
+    end
+
+    test "a port that dies without an exit status leaves the slot orphaned", context do
+      assert run("job_submit", %{"command" => "sleep 30"}, context)["success"] == true
+      %{runner: runner} = await_runner(context.issue.id)
+
+      ref = Process.monitor(runner)
+      %{port: port} = :sys.get_state(runner)
+      send(runner, {:EXIT, port, :killed})
+
+      assert_receive {:DOWN, ^ref, :process, ^runner, _reason}, 5_000
+      assert %{status: :orphaned} = Registry.get(context.issue.id)
+    end
+
+    test "unrelated messages are ignored", context do
+      assert run("job_submit", %{"command" => "sleep 5"}, context)["success"] == true
+      %{runner: runner} = await_runner(context.issue.id)
+
+      send(runner, :something_else)
+      _ = :sys.get_state(runner)
+
+      assert Process.alive?(runner)
+      run("job_cancel", %{}, context)
     end
   end
 
@@ -244,6 +486,28 @@ defmodule SymphonyElixir.JobsTest do
 
       assert Registry.get(context.issue.id) == nil
       assert run("job_submit", %{"command" => "true"}, context)["success"] == true
+    end
+  end
+
+  defp await_runner(issue_id, attempts \\ 100) do
+    case Registry.get(issue_id) do
+      %{runner: runner} = entry when is_pid(runner) -> entry
+      _ when attempts > 0 -> Process.sleep(20) && await_runner(issue_id, attempts - 1)
+    end
+  end
+
+  defp await_file(path, attempts \\ 100) do
+    case File.read(path) do
+      {:ok, contents} when contents != "" -> contents |> String.trim() |> String.to_integer()
+      _ when attempts > 0 -> Process.sleep(20) && await_file(path, attempts - 1)
+    end
+  end
+
+  defp await_dead(os_pid, attempts \\ 100) do
+    cond do
+      not Registry.os_process_alive?(os_pid) -> true
+      attempts > 0 -> Process.sleep(20) && await_dead(os_pid, attempts - 1)
+      true -> false
     end
   end
 

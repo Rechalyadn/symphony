@@ -3,6 +3,7 @@ defmodule SymphonyElixir.DelayedStateChangeTest do
 
   alias SymphonyElixir.Agent.{Intents, StateChangeTool}
   alias SymphonyElixir.AgentTools
+  alias SymphonyElixir.Linear.Adapter, as: LinearAdapter
 
   setup do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
@@ -127,6 +128,17 @@ defmodule SymphonyElixir.DelayedStateChangeTest do
       assert response["success"] == false
     end
 
+    test "rejects a non-string state", %{issue: issue} do
+      response = StateChangeTool.execute("request_state_change", %{"to_state" => 7}, issue: issue)
+
+      assert response["success"] == false
+      assert Intents.peek(issue.id) == nil
+    end
+
+    test "refuses a tool name it does not own", %{issue: issue} do
+      assert StateChangeTool.execute("something_else", %{}, issue: issue)["success"] == false
+    end
+
     test "routes through the bound tool set rather than the tracker adapter", %{issue: issue} do
       binding = AgentTools.bind()
 
@@ -134,6 +146,34 @@ defmodule SymphonyElixir.DelayedStateChangeTest do
 
       assert response["success"] == true
       assert %{to_state: "Executing"} = Intents.peek(issue.id)
+    end
+  end
+
+  describe "tracker writes" do
+    test "the memory tracker moves only the named work item", %{issue: issue} do
+      other = %Issue{id: "issue-untouched", identifier: "GEN-99", title: "Leave me", state: "Scoped"}
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, other])
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :memory_tracker_issues) end)
+
+      assert :ok = Tracker.apply_state_change(issue, "Awaiting Review")
+
+      assert {:ok, [moved]} = Tracker.fetch_issues_by_ids([issue.id])
+      assert moved.state == "Awaiting Review"
+      assert {:ok, [%{state: "Scoped"}]} = Tracker.fetch_issues_by_ids([other.id])
+    end
+
+    test "the Linear adapter delegates reads and writes to its client", %{issue: issue} do
+      defmodule FakeLinearClient do
+        def list_state_names(_issue), do: {:ok, ["Scoped", "Awaiting Review"]}
+        def apply_state_change(issue, state), do: send(self(), {:applied, issue.id, state}) && :ok
+      end
+
+      Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :linear_client_module) end)
+
+      assert {:ok, ["Scoped", "Awaiting Review"]} = LinearAdapter.list_state_names(issue)
+      assert :ok = LinearAdapter.apply_state_change(issue, "Awaiting Review")
+      assert_received {:applied, _id, "Awaiting Review"}
     end
   end
 

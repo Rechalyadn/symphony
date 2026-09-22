@@ -82,20 +82,15 @@ defmodule SymphonyElixir.Agent.StateChangeTool do
   end
 
   defp record(%Issue{id: issue_id, identifier: identifier, state: state}, to_state, reason) do
-    case Intents.put(issue_id, to_state, reason) do
-      :ok ->
-        Logger.info("Agent requested state change issue_identifier=#{identifier} from=#{state} to=#{to_state} reason=#{inspect(reason)}")
+    :ok = Intents.put(issue_id, to_state, reason)
+    Logger.info("Agent requested state change issue_identifier=#{identifier} from=#{state} to=#{to_state} reason=#{inspect(reason)}")
 
-        success(%{
-          "registered" => true,
-          "from_state" => state,
-          "to_state" => to_state,
-          "appliedWhen" => "after this run returns"
-        })
-
-      {:error, :unavailable} ->
-        failure("Symphony cannot record state changes right now. Report this in a work item comment and stop.")
-    end
+    success(%{
+      "registered" => true,
+      "from_state" => state,
+      "to_state" => to_state,
+      "appliedWhen" => "after this run returns"
+    })
   end
 
   defp normalize(arguments) when is_map(arguments) do

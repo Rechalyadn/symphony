@@ -57,7 +57,7 @@ defmodule SymphonyElixir.AgentTools do
   Runs one dynamic tool call against the tools captured by `bind/0`.
   """
   @spec execute(binding(), String.t() | nil, term(), keyword()) :: map()
-  def execute(binding, tool, arguments, opts \\ []) do
+  def execute(binding, tool, arguments, opts) do
     case Map.get(native_tools(binding), tool) do
       nil -> Tracker.execute_bound_agent_tool(binding, tool, arguments, opts)
       module -> module.execute(tool, arguments, opts)

@@ -72,9 +72,7 @@ defmodule SymphonyElixir.Agent.ModelTier do
     end)
   end
 
-  defp tier_label(_issue, _group, _mapping), do: :none
-
-  defp strip_prefix(label, prefixes) when is_binary(label) do
+  defp strip_prefix(label, prefixes) do
     normalized = label |> String.trim() |> String.downcase()
 
     Enum.find_value(prefixes, fn prefix ->
@@ -84,6 +82,4 @@ defmodule SymphonyElixir.Agent.ModelTier do
       end
     end)
   end
-
-  defp strip_prefix(_label, _prefixes), do: nil
 end

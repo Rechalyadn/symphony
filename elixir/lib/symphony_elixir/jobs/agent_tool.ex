@@ -145,7 +145,6 @@ defmodule SymphonyElixir.Jobs.AgentTool do
       {:ok, entry} -> spawn_runner(issue, entry, run, opts)
       {:error, {:already_running, running}} -> failure("This work item already has a job running (#{running.label || running.job_id}). Wait for it with `job_wait`, or stop it with `job_cancel`.")
       {:error, {:compute_limit, compute, limit}} -> failure("The `#{compute}` compute budget is full (#{limit} running). Try again after one finishes.")
-      {:error, :unavailable} -> failure("Symphony cannot host jobs right now. Report this in a work item comment and stop.")
     end
   end
 
@@ -215,7 +214,7 @@ defmodule SymphonyElixir.Jobs.AgentTool do
     end
   end
 
-  defp compute_tier(%Issue{labels: labels}) when is_list(labels) do
+  defp compute_tier(%Issue{labels: labels}) do
     default = Config.settings!().jobs.default_compute
 
     Enum.find_value(labels, default, fn label ->
@@ -226,16 +225,12 @@ defmodule SymphonyElixir.Jobs.AgentTool do
     end)
   end
 
-  defp compute_tier(_issue), do: Config.settings!().jobs.default_compute
-
   defp gated_state?(gated_states, state) when is_list(gated_states) and is_binary(state) do
     normalized = state |> String.trim() |> String.downcase()
     Enum.any?(gated_states, &(&1 |> String.trim() |> String.downcase() == normalized))
   end
 
   defp gated_state?(_gated_states, _state), do: false
-
-  defp describe(nil), do: nil
 
   defp describe(entry) do
     %{
@@ -250,8 +245,6 @@ defmodule SymphonyElixir.Jobs.AgentTool do
       "still_running_detached" => entry.status == :orphaned and Registry.os_process_alive?(entry.os_pid)
     }
   end
-
-  defp log_tail(nil, _lines), do: nil
 
   defp log_tail(entry, lines) do
     case File.read(entry.log_file) do

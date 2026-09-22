@@ -2,6 +2,7 @@ defmodule SymphonyElixir.ModelTierTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Agent.ModelTier
+  alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Linear.Client
 
   defp issue(labels) do
@@ -44,6 +45,15 @@ defmodule SymphonyElixir.ModelTierTest do
     write_workflow_file!(Workflow.workflow_file_path())
 
     assert %{model: nil, effort: nil} = ModelTier.resolve(issue(["model/terra"]))
+  end
+
+  test "tier values that are not strings are dropped at parse time" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               codex: %{model_tiers: %{"Terra" => " gpt-5.6-terra ", "luna" => 5}}
+             })
+
+    assert settings.codex.model_tiers == %{"terra" => "gpt-5.6-terra"}
   end
 
   test "a bare label without the group prefix is not a tier" do

@@ -13,7 +13,7 @@ defmodule SymphonyElixir.Jobs.Supervisor do
   alias SymphonyElixir.Jobs.Runner
 
   @spec start_link(keyword()) :: Supervisor.on_start()
-  def start_link(opts \\ []) do
+  def start_link(opts) do
     DynamicSupervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 

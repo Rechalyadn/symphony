@@ -27,7 +27,7 @@ defmodule SymphonyElixir.Agent.Intents do
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts \\ []) do
+  def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
@@ -40,15 +40,10 @@ defmodule SymphonyElixir.Agent.Intents do
   @doc """
   Registers the state this run should end in. A second call replaces the first.
   """
-  @spec put(String.t(), String.t(), String.t() | nil) :: :ok | {:error, :unavailable}
-  def put(issue_id, to_state, reason) do
-    if ready?() and is_binary(issue_id) and is_binary(to_state) do
-      intent = %{to_state: to_state, reason: reason, requested_at: DateTime.utc_now()}
-      :ets.insert(@table, {issue_id, intent})
-      :ok
-    else
-      {:error, :unavailable}
-    end
+  @spec put(String.t(), String.t(), String.t() | nil) :: :ok
+  def put(issue_id, to_state, reason) when is_binary(issue_id) and is_binary(to_state) do
+    :ets.insert(@table, {issue_id, %{to_state: to_state, reason: reason, requested_at: DateTime.utc_now()}})
+    :ok
   end
 
   @doc """

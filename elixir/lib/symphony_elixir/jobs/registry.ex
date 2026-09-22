@@ -45,7 +45,7 @@ defmodule SymphonyElixir.Jobs.Registry do
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts \\ []) do
+  def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
@@ -85,12 +85,11 @@ defmodule SymphonyElixir.Jobs.Registry do
   Serialized through the GenServer so two calls in one code-mode block cannot
   both win.
   """
-  @type claim_error ::
-          {:already_running, entry()} | {:compute_limit, String.t(), pos_integer()} | :unavailable
+  @type claim_error :: {:already_running, entry()} | {:compute_limit, String.t(), pos_integer()}
 
   @spec claim(String.t(), map()) :: {:ok, entry()} | {:error, claim_error()}
   def claim(issue_id, attrs) when is_binary(issue_id) do
-    if ready?(), do: GenServer.call(__MODULE__, {:claim, issue_id, attrs}), else: {:error, :unavailable}
+    GenServer.call(__MODULE__, {:claim, issue_id, attrs})
   end
 
   @doc """
@@ -193,14 +192,10 @@ defmodule SymphonyElixir.Jobs.Registry do
   """
   @spec running_by_compute() :: %{String.t() => non_neg_integer()}
   def running_by_compute do
-    if ready?() do
-      @table
-      |> :ets.tab2list()
-      |> Enum.filter(fn {_id, entry} -> entry.status == :running end)
-      |> Enum.frequencies_by(fn {_id, entry} -> entry.compute end)
-    else
-      %{}
-    end
+    @table
+    |> :ets.tab2list()
+    |> Enum.filter(fn {_id, entry} -> entry.status == :running end)
+    |> Enum.frequencies_by(fn {_id, entry} -> entry.compute end)
   end
 
   defp flush_finished(issue_id) do
