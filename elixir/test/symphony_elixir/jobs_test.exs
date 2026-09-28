@@ -368,6 +368,21 @@ defmodule SymphonyElixir.JobsTest do
       assert %{status: :orphaned} = Registry.get(context.issue.id)
     end
 
+    test "shutting down after the job already exited does not crash", context do
+      # The port can close on its own between a stop request and the runner
+      # handling it; closing it again must not take the runner down mid-kill.
+      assert run("job_submit", %{"command" => "sleep 0.2"}, context)["success"] == true
+      %{runner: runner} = await_runner(context.issue.id)
+
+      :ok = :sys.suspend(runner)
+      Process.sleep(600)
+
+      ref = Process.monitor(runner)
+      :ok = DynamicSupervisor.terminate_child(SymphonyElixir.Jobs.Supervisor, runner)
+
+      assert_receive {:DOWN, ^ref, :process, ^runner, :shutdown}, 5_000
+    end
+
     test "unrelated messages are ignored", context do
       assert run("job_submit", %{"command" => "sleep 5"}, context)["success"] == true
       %{runner: runner} = await_runner(context.issue.id)
