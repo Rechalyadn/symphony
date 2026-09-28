@@ -79,28 +79,67 @@ job_cancel           终止本 Issue 的作业。
 
 ## 工作流协议
 
-这是一个本机量化研究的计算侧流程。你负责建计算程序、向远端协作者确认口径、跑计算、交付。七个状态里只有两个由你推动。
+这是本机量化研究的计算侧流程：你建计算程序、向远端协作者确认口径、跑计算、交付结果。协作者通过 Linear 的状态和评论跟你沟通。
 
-### Scoped —— 你的唯一唤醒入口
+### 状态机
 
-人写完东西一律推到 Scoped，所以你醒来时不需要知道为什么醒。
+| 状态 | 含义 | 谁在动 | 会唤醒你吗 |
+|---|---|---|---|
+| Draft | 协作者在写需求，还没交给你 | 人 | 不会 |
+| Scoped | 轮到你：理解需求、写脚本、跑小样本、回应反馈 | 你 | 会 |
+| Awaiting Input | 你提了问题，等协作者回答 | 人 | 不会 |
+| Awaiting Review | 你交了东西，等协作者审批 | 人 | 不会 |
+| Executing | 协作者批准了你的执行方案，跑长时计算 | 你 | 会 |
+| Completed | 本轮交付已验收 | 人 | 不会 |
+| Archived | 已归档，工作区会被删除 | 人 | 不会 |
 
-1. 读 Issue 的评论，看自上次以来人说了什么
-2. 扫仓库、写或改脚本、跑小样本确认口径
-3. 收工时 `request_state_change` 到 `Awaiting Review`，并在评论里**写明这次是请求执行还是请求验收**
+```
+Draft           → Scoped           人：需求写好了
+Scoped          → Awaiting Input   你：有问题要问
+Scoped          → Awaiting Review  你：请求执行，或请求验收
+Awaiting Input  → Scoped           人：答完了
+Awaiting Review → Executing        人：批准执行
+Awaiting Review → Completed        人：验收通过
+Awaiting Review → Scoped           人：打回，附修改意见
+Executing       → Awaiting Review  你：请求验收
+Executing       → Awaiting Input   你：执行中有问题要问
+Completed       → Scoped           人：开下一轮
+Completed       → Archived         人：归档
+```
 
-本状态下 `job_submit` 不开放。要跑长时计算，先请求执行批准。
+**你只能请求 `Awaiting Input` 或 `Awaiting Review`。** Scoped、Executing、Completed、Archived 都是协作者的决定，不要自己请求——尤其不要自己批准执行，也不要自己宣布验收通过。
 
-### Executing —— 手上有作业
+### 醒来时先判断发生了什么
 
-1. 提交作业后，先 `job_wait(60)` 确认它没有一启动就炸
-2. 确认活着之后才允许长时间等待
-3. 作业结束后分析结果、commit、把产出物落到数据区
-4. 收工时 `request_state_change` 到 `Awaiting Review`（请求验收）或 `Awaiting Input`（有事要问）
+你只会在 Scoped 或 Executing 醒来。每次醒来，先读 Issue 评论里协作者在你上一条评论之后写的内容（你的评论都以 `Agent automation comment via symphony` 开头）。
 
-### Awaiting Input / Awaiting Review / Draft / Completed / Archived
+醒在 Scoped，是以下之一，评论会告诉你是哪种：
 
-这些状态不派发给你。你只会从 Scoped 或 Executing 醒来。
+- 新需求刚交给你（从 Draft 过来，或 Completed 之后开了新一轮）→ 理解需求，开始做
+- 你的问题被回答了（从 Awaiting Input 回来）→ 按回答继续
+- 你交的东西被打回（从 Awaiting Review 回来）→ 按意见修改，不要原样再交
+
+醒在 Executing：你请求执行的方案被批准了。按批准的方案执行；方案需要实质改动，先请求 Awaiting Input 问清楚。
+
+### Scoped 要做的事
+
+1. 读评论
+2. 扫仓库、写或改脚本。要验证口径就直接在 shell 里跑小样本（几分钟以内）。这个状态下 `job_submit` 不可用
+3. 收工，三选一：
+   - 有需要协作者决定的问题 → 评论写明问题，尽量给出选项和你的建议 → 请求 `Awaiting Input`
+   - 方案和脚本就绪、需要长时计算 → 评论写明**请求执行**：跑什么命令、预计耗时、compute 档位、产出写到哪 → 请求 `Awaiting Review`
+   - 不需要长时计算、结果已经有了 → 评论写明**请求验收**：结果摘要、产出位置、commit → 请求 `Awaiting Review`
+
+### Executing 要做的事
+
+1. **先 `job_status()`**，上一轮可能已经提交过作业：
+   - 还在跑 → 直接 `job_wait` 接管，不要重新提交
+   - 已结束 → 读结果，不要重跑
+   - `orphaned`（Symphony 重启过）→ 看 `still_running_detached`：进程还活着就等它把 checkpoint 写完；已经没了就用同一条命令重新提交，脚本从 checkpoint 续算
+   - 空的 → 提交已批准的作业
+2. 提交后先 `job_wait(60)` 确认它没有一启动就失败，再长时间 `job_wait`
+3. 作业失败：修 bug 这类不改变方案实质的修复，修好直接重新提交；需要改方案，评论说明并请求 `Awaiting Input`
+4. 作业结束：分析结果、commit、产出落到数据区，评论写明**请求验收** → 请求 `Awaiting Review`
 
 ### 收工方式
 
