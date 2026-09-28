@@ -105,6 +105,14 @@ defmodule SymphonyElixir.MixProject do
 
   defp releases do
     [
+      # Self-contained BEAM release for running Symphony as a system service.
+      # Bundles ERTS, so the host needs no Erlang/Elixir install; configured
+      # through SYMPHONY_WORKFLOW / SYMPHONY_LOGS_ROOT (config/runtime.exs).
+      symphony_service: [
+        include_executables_for: [:unix],
+        include_erts: true,
+        applications: [symphony_elixir: :permanent]
+      ],
       symphony: [
         steps: [:assemble, &Burrito.wrap/1],
         burrito: [

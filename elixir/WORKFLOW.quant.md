@@ -16,7 +16,7 @@ workspace:
   root: ~/code/symphony-workspaces
 agent:
   max_concurrent_agents: 8
-  max_turns: 20
+  max_turns: 50
   max_concurrent_agents_by_state:
     Scoped: 4
     Executing: 3
@@ -28,6 +28,17 @@ codex:
   resume_threads: true
   stall_timeout_ms: 600000
   turn_timeout_ms: 3600000
+  # Issue labels name a tier (`model/terra`), this maps it to a model id, so
+  # a model upgrade is one edit here. Unknown or missing labels keep the
+  # model configured in codex's own config.
+  model_tiers:
+    terra: "gpt-5.6-terra"
+    luna: "gpt-5.6-luna"
+  reasoning_efforts:
+    low: "low"
+    medium: "medium"
+    high: "high"
+    deep: "xhigh"
 jobs:
   gated_states:
     - Executing
@@ -43,8 +54,19 @@ hooks:
     git config user.email <你的邮箱>
     git config user.name <你的名字>
     git commit -q --allow-empty -m "workspace init"
-  before_remove: |
-    <归档到冷区的命令>
+  # Runs before an Archived issue's workspace is deleted. Failures are
+  # ignored and the deletion goes ahead, so results must already live outside
+  # the workspace; this is a second copy, not the only one.
+  # before_remove: |
+  #   rsync -a ./ "/path/to/cold-storage/$(basename "$PWD")/"
+server:
+  # JSON state at /api/v1/state and a live dashboard at /, local only.
+  host: 127.0.0.1
+  port: 4040
+observability:
+  # The terminal dashboard writes to stdout; under systemd that floods the
+  # journal. Use the web dashboard above instead.
+  dashboard_enabled: false
 ---
 
 # Issue {{ issue.identifier }} · {{ issue.title }}
