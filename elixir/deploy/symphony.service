@@ -1,0 +1,24 @@
+# systemd user unit for Symphony. Installed by deploy/install.sh; edit the
+# copy in ~/.config/systemd/user/ only if you know why.
+[Unit]
+Description=Symphony orchestrator
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+# Site-specific settings (Linear key, workflow path) live here, mode 600.
+EnvironmentFile=%h/.config/symphony/env
+# The user manager's PATH does not include ~/.local/bin, where codex lives.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/.local/state/symphony
+ExecStart=%h/.local/share/symphony/current/bin/symphony_service start
+Restart=on-failure
+RestartSec=10
+# SIGTERM reaches every process in the unit, running jobs included, and
+# Symphony also kills job process groups on shutdown. Jobs that checkpoint
+# resume when resubmitted; give them time to write one.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
